@@ -1,0 +1,138 @@
+# Product Catalog technical case — local environment.
+#
+# The infrastructure below works out of the box. You should not need to change
+# it, though you are welcome to. Bring it up with:
+#
+#     docker compose up -d redpanda redpanda-setup postgres
+#
+# and add your own services once they exist:
+#
+#     docker compose up --build
+#
+# Kafka bootstrap servers:
+#   from inside the compose network : redpanda:9092
+#   from your laptop                : localhost:19092
+#
+# Topic auto-creation is switched on by the redpanda-setup service below, so
+# you can pick your own topic names and publish to them directly.
+
+name: product-catalog-case
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Kafka-compatible broker. Redpanda is used instead of Kafka + ZooKeeper
+  # because it is a single container and boots in a couple of seconds. Any
+  # Kafka client library works against it unchanged.
+  # ---------------------------------------------------------------------------
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=1G
+      - --overprovisioned
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"   # Kafka API, from the host
+      - "9644:9644"     # admin API
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # One-shot: turns on topic auto-creation once the broker is up, so you can
+  # publish to a topic name of your choosing without creating it first.
+  # Exits immediately after running. `docker compose ps` will show it as
+  # "exited (0)" — that is expected, not a failure.
+  # ---------------------------------------------------------------------------
+  redpanda-setup:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    container_name: redpanda-setup
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: "rpk cluster config set auto_create_topics_enabled true --api-urls redpanda:9644"
+    restart: on-failure
+
+  # ---------------------------------------------------------------------------
+  # Optional web UI for inspecting topics and messages: http://localhost:8085
+  # Handy for demoing your event flow during the interview.
+  # ---------------------------------------------------------------------------
+  console:
+    image: docker.redpanda.com/redpandadata/console:v2.7.2
+    container_name: redpanda-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8085:8080"
+
+  # ---------------------------------------------------------------------------
+  # Relational store, if you want one. Using it is entirely optional — see the
+  # brief. Nothing else in this file depends on it.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: catalog
+      POSTGRES_PASSWORD: catalog
+      POSTGRES_DB: catalog
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U catalog -d catalog"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # Your services. Both are commented out so that `docker compose up` works
+  # before you have written anything. Uncomment as you go, and change whatever
+  # you need to — build context, ports, environment, health checks.
+  # ---------------------------------------------------------------------------
+
+  product-service:
+    build:
+      context: ./product-service
+    container_name: product-service
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/catalog
+      SPRING_DATASOURCE_USERNAME: catalog
+      SPRING_DATASOURCE_PASSWORD: catalog
+    ports:
+      - "8080:8080"
+
+  indexer:
+    build:
+      context: ./indexer
+    container_name: indexer
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      KAFKA_TOPIC: product.changed
+      KAFKA_GROUP_ID: product-catalog-indexer
+
+volumes:
+  postgres-data:

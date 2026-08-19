@@ -1,0 +1,5 @@
+# Exclude the local Maven build output from the Docker build context.
+# Without this, the entire target/ directory (compiled classes, jars) is
+# sent to the Docker daemon on every build, adding seconds to startup.
+# The Dockerfile does its own clean Maven build inside the container.
+target/

@@ -1,0 +1,2 @@
+# Nothing to exclude for the indexer — there is no local build output.
+# File exists to make intent explicit.

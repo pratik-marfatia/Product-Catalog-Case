@@ -1,0 +1,41 @@
+spring:
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/catalog}
+    username: ${SPRING_DATASOURCE_USERNAME:catalog}
+    password: ${SPRING_DATASOURCE_PASSWORD:catalog}
+    hikari:
+      maximum-pool-size: 10
+
+  jpa:
+    hibernate:
+      # Flyway owns the schema; JPA only validates it on startup.
+      ddl-auto: validate
+    # Disable open-in-view: we do not want transactions held open for the
+    # duration of HTTP response rendering.
+    open-in-view: false
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:19092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        # Do not embed Java type headers in messages. Consumers should
+        # deserialize based on schema version in the envelope, not JVM types.
+        spring.json.add.type.headers: false
+
+  jackson:
+    serialization:
+      # Serialize Instant as ISO-8601 string, not epoch milliseconds.
+      write-dates-as-timestamps: false
+
+server:
+  port: 8080
+
+kafka:
+  topics:
+    product-changed: product.changed

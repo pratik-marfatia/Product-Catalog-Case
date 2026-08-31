@@ -26,14 +26,14 @@ public class ProductController {
      * our system has the record.
      */
     @PutMapping("/{id}")
-    public ResponseEntity<ProductResponse> upsert(@PathVariable UUID id,
-                                                   @RequestBody ProductRequest request) {
+    public ResponseEntity<ProductResponse> upsertProduct(@PathVariable UUID id,
+                                                         @RequestBody ProductRequest request) {
         Product product = productService.upsert(id, request);
         return ResponseEntity.ok(ProductResponse.from(product));
     }
 
     @GetMapping("/{id}")
-    public ResponseEntity<ProductResponse> get(@PathVariable UUID id) {
+    public ResponseEntity<ProductResponse> getProduct(@PathVariable UUID id) {
         return productService.findById(id)
                 .map(ProductResponse::from)
                 .map(ResponseEntity::ok)

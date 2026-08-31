@@ -19,10 +19,10 @@ import java.util.UUID;
  *   payload       — current state of the product at the time of publish.
  */
 public record ProductEvent(
-        String eventId,
+        UUID eventId,
         String eventType,
         Instant occurredAt,
-        String schemaVersion,
+        int schemaVersion,
         Payload payload
 ) {
 
@@ -39,10 +39,10 @@ public record ProductEvent(
 
     public static ProductEvent from(Product product) {
         return new ProductEvent(
-                UUID.randomUUID().toString(),
+                UUID.randomUUID(),
                 "product.changed",
                 Instant.now(),
-                "1.0",
+                1,
                 new Payload(
                         product.getId(),
                         product.getName(),

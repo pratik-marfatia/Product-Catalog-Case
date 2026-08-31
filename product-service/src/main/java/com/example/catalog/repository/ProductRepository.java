@@ -44,9 +44,9 @@ public interface ProductRepository extends JpaRepository<Product, UUID> {
                     updated_at        = NOW()
                 WHERE products.source_updated_at < EXCLUDED.source_updated_at
             """)
-    int upsert(@Param("id") UUID id,
-               @Param("name") String name,
-               @Param("status") String status,
-               @Param("country") String country,
-               @Param("sourceUpdatedAt") Instant sourceUpdatedAt);
+    int upsertProduct(@Param("id") UUID id,
+                      @Param("name") String name,
+                      @Param("status") String status,
+                      @Param("country") String country,
+                      @Param("sourceUpdatedAt") Instant sourceUpdatedAt);
 }

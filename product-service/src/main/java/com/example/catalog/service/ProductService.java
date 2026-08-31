@@ -35,7 +35,7 @@ public class ProductService {
      */
     @Transactional
     public Product upsert(@NonNull UUID id, ProductRequest request) {
-        int affected = repository.upsert(
+        int affected = repository.upsertProduct(
                 id,
                 request.name(),
                 request.status().name(),

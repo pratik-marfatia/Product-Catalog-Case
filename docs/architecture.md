@@ -1,6 +1,28 @@
 # Architecture — Product Catalog Platform
 
+The Product Catalog Platform is an event-driven domain that owns product identity, pricing, and stock data sourced from three independent upstream systems. The core architectural choice is a **log-compacted Kafka backbone** that decouples ingestion from the two read paths (BFF and search), enables index rebuild by replay, and absorbs burst loads from PIM bulk imports and pricing campaigns. This document covers the full system design; the implemented scope is **`product-service` and `search-indexer`** only — all other services are design.
+
+> **Navigation guide:** To understand what was built, read §2 and §4a. To evaluate design decisions, read §7 (ADRs). To understand what was deliberately omitted, see §8.
+
+## Contents
+
+| § | Section | What's in it |
+|---|---|---|
+| — | [Phase 0 Decisions](#phase-0-decisions-locked-in) | Key technology choices locked before implementation — persistence, transport, read shape, control fields |
+| 1 | [System Context](#1-system-context) | What we own vs. upstream systems (PIM, Pricing SaaS, WMS) and consumers (BFF, search engine); flowchart |
+| 2 | [Component Map](#2-component-map) | Internal services, Kafka topics, read layer, and indexing path; flowchart |
+| 3 | [Product Model](#3-product-model) | Control fields with justification table; fields deliberately excluded |
+| 4 | [Data Flows](#4-data-flows) | Sequence diagrams: §4a product path (implemented), §4b price path (design), §4c stock path (design) |
+| 5 | [BFF Read Path](#5-bff-read-path) | Redis-backed composite read model; latency model; partial-document and event-ordering edge cases — **design only** |
+| 6 | [Index Rebuild Strategy](#6-index-rebuild-strategy) | Log-compacted topic replay, blue/green index swap, scale check against 1-hour SLA — **design only** |
+| 7 | [Architecture Decision Records](#7-architecture-decision-records) | ADR-001 Kafka · ADR-002 Log compaction · ADR-003 Composite read model · ADR-004 Outbox |
+| 8 | [What Is Not Built (and Why)](#8-what-is-not-built-and-why) | Omissions table with rationale for each |
+
+---
+
 ## Phase 0 Decisions (locked in)
+
+These decisions were locked before writing any code; the ADRs in §7 expand on the reasoning behind each one.
 
 | Decision | Choice | One-line rationale |
 |---|---|---|
@@ -18,16 +40,16 @@ What we own versus what we integrate with.
 ```mermaid
 flowchart TB
     subgraph upstream["Upstream Systems (not ours)"]
-        PIM["PIM System\nPostgres · REST API · change events"]
+        PIM["PIM System\nPostgres · Kafka change events\n(REST API for reconciliation only)"]
         PRICING["Pricing SaaS\nREST API (rate-limited) · webhooks"]
         WMS["Warehouse Management\nKafka topic · at-least-once · unordered"]
     end
 
     subgraph ours["Product Catalog Domain (what we build)"]
         PS["product-service\nJava / Spring Boot"]
-        PRS["price-service\nfuture"]
-        SS["stock-service\nfuture"]
-        CRM["composite-read-model\nfuture"]
+        PRS["price-service\n(future — design only)"]
+        SS["stock-service\n(future — design only)"]
+        CRM["composite-read-model\n(future — design only)"]
         IDX["search-indexer\nGo"]
     end
 
@@ -36,7 +58,7 @@ flowchart TB
         SEARCH["Search Engine\n30 s visibility SLA"]
     end
 
-    PIM -->|"change events / REST poll"| PS
+    PIM -->|"pim.product.changes\nKafka topic (burst-safe)"| PS
     PRICING -->|"webhook"| PRS
     WMS -->|"Kafka topic"| SS
 
@@ -49,20 +71,24 @@ flowchart TB
 
     CRM -->|"Redis cache"| BFF
     IDX -->|"index document"| SEARCH
+
+    style PRS fill:#e8e8e8,stroke:#aaa,color:#888
+    style SS fill:#e8e8e8,stroke:#aaa,color:#888
+    style CRM fill:#e8e8e8,stroke:#aaa,color:#888
 ```
 
 ---
 
 ## 2. Component Map
 
-Shows the internal structure of the Product Catalog domain — the services we own, the Kafka topics that connect them, and the two read paths (BFF and search). The three ingestion services (product, price, stock) each own one domain and publish normalised events to their respective log-compacted topics. The read layer (composite-read-model + Redis) serves the latency-sensitive BFF. The search-indexer consumes all three topics independently and builds search documents for the index. Services in grey are design only and not implemented in this exercise.
+Shows the internal structure of the Product Catalog domain — the services we own, the Kafka topics that connect them, and the two read paths (BFF and search). The three ingestion services (product, price, stock) each own one domain and publish normalised events to their respective log-compacted topics. The read layer (composite-read-model + Redis) serves the latency-sensitive BFF. The search-indexer consumes all three topics independently and builds search documents for the index. **Services shown in grey are design only and not implemented in this exercise.**
 
 ```mermaid
 flowchart LR
     subgraph ingestion["Ingestion"]
         PS["product-service\n· upsert (version guard)\n· publishes ProductChanged"]
-        PRS["price-service\n· webhook receiver\n· publishes PriceChanged"]
-        SS["stock-service\n· idempotent stock merge\n· publishes StockChanged"]
+        PRS["price-service\n· webhook receiver\n· publishes PriceChanged\n(design only)"]
+        SS["stock-service\n· idempotent stock merge\n· publishes StockChanged\n(design only)"]
     end
 
     subgraph broker["Kafka (Redpanda)"]
@@ -72,7 +98,7 @@ flowchart LR
     end
 
     subgraph read["Read Layer"]
-        CRM["composite-read-model\n· assembles product+price+stock\n· writes to Redis"]
+        CRM["composite-read-model\n· assembles product+price+stock\n· writes to Redis\n(design only)"]
         REDIS[("Redis\nkey: product:{id}:{country}")]
     end
 
@@ -92,6 +118,11 @@ flowchart LR
     T1 --> IDX
     T2 --> IDX
     T3 --> IDX
+
+    style PRS fill:#e8e8e8,stroke:#aaa,color:#888
+    style SS fill:#e8e8e8,stroke:#aaa,color:#888
+    style CRM fill:#e8e8e8,stroke:#aaa,color:#888
+    style REDIS fill:#e8e8e8,stroke:#aaa,color:#888
 ```
 
 > **Scope of this exercise:** `product-service` and `search-indexer` are implemented.
@@ -131,25 +162,30 @@ flowchart LR
 ```mermaid
 sequenceDiagram
     participant PIM
+    participant K0 as Kafka (pim.product.changes)
     participant PS as product-service
     participant DB as Postgres
     participant K as Kafka (product.changed)
     participant CRM as composite-read-model
     participant IDX as search-indexer
 
-    PIM->>PS: PUT /products/{id}  (product payload + sourceUpdatedAt)
+    PIM->>K0: publish PimProductEvent\n(editorial change or bulk import row)
+    PS->>K0: consume PimProductEvent
     PS->>DB: INSERT ... ON CONFLICT DO UPDATE\nWHERE source_updated_at < EXCLUDED.source_updated_at
     DB-->>PS: upserted / skipped (stale)
     alt upserted
         PS->>K: publish ProductChanged {eventId, eventType, occurredAt,\nschemaVersion, payload}
         K-->>CRM: consume ProductChanged
-        Note over CRM: Update or create partial composite doc\n(price + stock slots remain until their events arrive)
-        CRM->>CRM: write to Redis
+        Note over CRM: Upsert product slot in composite doc\n(price + stock slots remain until their events arrive)\nSee §5 for partial-document handling
+        CRM->>CRM: write to Redis (visible only if product slot present)
         K-->>IDX: consume ProductChanged
         IDX->>IDX: build SearchDocument\nlog as structured JSON
     end
-    PS-->>PIM: 200 OK / 204 No Content
 ```
+
+**Why Kafka instead of REST for PIM ingestion:** PIM bulk imports arrive as bursts of 100k+ in a few minutes. Driving that over REST (either PIM calling product-service 100k times, or product-service polling PIM 100k times) exhausts connection pools, hits timeouts, and requires complex retry logic. PIM publishing to a Kafka topic costs nothing extra at burst time — Kafka absorbs the spike and product-service consumes at its own pace. The REST API is retained only for on-demand reconciliation (e.g. re-fetching a specific product after a suspected missed event).
+
+**CDC alternative:** If PIM cannot publish to Kafka directly, Debezium CDC on PIM's PostgreSQL WAL achieves the same outcome without requiring PIM to change anything. Every INSERT/UPDATE in PIM's products table appears as a Kafka message automatically, including bulk imports.
 
 **Idempotency note:** The `ON CONFLICT` guard on `sourceUpdatedAt` means replaying the same event twice is safe. The indexer consuming the same Kafka message twice is also safe — it builds and logs the same document.
 
@@ -158,6 +194,8 @@ sequenceDiagram
 ---
 
 ### 4b. Price path (design only)
+
+> **Not implemented.** Code for this path does not exist in the repository. The design below documents how it would be built.
 
 ```mermaid
 sequenceDiagram
@@ -182,6 +220,8 @@ sequenceDiagram
 
 ### 4c. Stock path (design only)
 
+> **Not implemented.** Code for this path does not exist in the repository. The design below documents how it would be built.
+
 ```mermaid
 sequenceDiagram
     participant WMS
@@ -202,6 +242,8 @@ sequenceDiagram
 ---
 
 ## 5. BFF Read Path
+
+> **Design only — not implemented.** This section describes how the composite-read-model and Redis cache would serve the storefront BFF. No code for this path exists in the repository.
 
 ```mermaid
 flowchart LR
@@ -227,11 +269,28 @@ flowchart LR
 - Cache miss: BFF → composite-read-model → its own DB → Redis → BFF ≈ 20–50 ms. Still fine.
 - Cache TTL of 30 s is a reasonable default; stock changes frequently so we accept up to 30 s staleness on stock data for BFF. Price and product can have longer TTLs (5 min).
 
-**Partial data problem:** If the composite doc is assembled before price or stock has arrived (e.g. new product just created), the read model writes a partial document and updates it as each domain event arrives. The BFF receives whatever is current. Missing price → BFF shows "price unavailable". Missing stock → BFF shows "out of stock". This is preferable to blocking the read until all three are present.
+**Partial data problem — price/stock arrives before product:**
+
+Because `product.changed`, `price.changed`, and `stock.changed` are independent Kafka topics consumed in parallel, there is no ordering guarantee across them. A `PriceChanged` event for a newly introduced productId may arrive at the composite-read-model before the corresponding `ProductChanged` event.
+
+Handling strategy:
+
+| Scenario | What CRM does |
+|---|---|
+| `ProductChanged` arrives first (normal case) | Create composite doc with product slot filled; price/stock slots empty ("unavailable") |
+| `PriceChanged` or `StockChanged` arrives first | Store price/stock in a holding record keyed by productId; do **not** surface to BFF yet |
+| `ProductChanged` arrives later | Merge holding record into composite doc; mark as visible to BFF |
+| `ProductChanged` never arrives (orphan) | Holding record expires via TTL (e.g. 1 hour); emit a dead-letter alert |
+
+**The key invariant:** the product slot is the anchor. A composite doc is only surfaced to the BFF once `ProductChanged` has been received for that productId. Price and stock can trail freely — missing price → BFF shows "price unavailable"; missing stock → BFF shows "out of stock". This is preferable to blocking the read until all three are present, and preferable to serving a record with a null product name.
+
+This same invariant applies to the search indexer: the indexer only emits a `SearchDocument` for a productId once it has seen a `ProductChanged` event, even if it has already buffered price/stock data for that id.
 
 ---
 
 ## 6. Index Rebuild Strategy
+
+> **Design only — not implemented.** Topics are auto-created in this exercise and not explicitly configured as log-compacted. Production would apply log-compaction config via `rpk topic alter` or Terraform. The rebuild script described below does not exist in this repository.
 
 **Requirement:** Rebuild from scratch within 1 hour without taking the site down.
 
@@ -247,10 +306,16 @@ All three domain topics (`product.changed`, `price.changed`, `stock.changed`) ar
 5. Once caught up to live offset, atomically point the search engine alias at the new index.
 6. Decommission the old index.
 
-**Scale check:**
-- 2M products × ~1 KB avg message ≈ 2 GB on topic
-- At 50 MB/s consumer throughput ≈ 40 seconds to consume all messages
-- Well within the 1-hour SLA, with headroom for price and stock topics
+**Scale check against the 1-hour SLA:**
+
+| Factor | Value |
+|---|---|
+| Catalogue size | 2M products |
+| Avg message size | ~1 KB |
+| Total topic size | ~2 GB |
+| Consumer throughput | 50 MB/s |
+| Estimated replay time | ~40 seconds |
+| Headroom (price + stock topics) | ample — well within 1 hour |
 
 **Live indexer is unaffected** — it runs as its own consumer group and continues writing to the live index throughout.
 
@@ -260,6 +325,7 @@ All three domain topics (`product.changed`, `price.changed`, `stock.changed`) ar
 
 ### ADR-001 — Kafka as transport between services
 
+**Date:** 2026-08-29
 **Status:** Accepted
 
 **Context:** Product-service needs to notify downstream consumers (indexer, future composite-read-model) when a product is created or updated. Options: synchronous HTTP callbacks, or async Kafka events.
@@ -278,6 +344,7 @@ All three domain topics (`product.changed`, `price.changed`, `stock.changed`) ar
 
 ### ADR-002 — Log-compacted topics for durable state
 
+**Date:** 2026-08-29
 **Status:** Accepted
 
 **Context:** The search index must be rebuildable within 1 hour. Options: full DB scan via a batch job, separate snapshot API, or log-compacted Kafka topics.
@@ -294,6 +361,7 @@ All three domain topics (`product.changed`, `price.changed`, `stock.changed`) ar
 
 ### ADR-003 — Composite read model for BFF
 
+**Date:** 2026-08-29
 **Status:** Accepted
 
 **Context:** BFF needs product + price + stock in a single response at 500 rps / p95 < 200 ms. Options: BFF fans out to three services, or a composite read model pre-assembles the document.
@@ -311,7 +379,8 @@ All three domain topics (`product.changed`, `price.changed`, `stock.changed`) ar
 
 ### ADR-004 — Direct publish vs. transactional outbox
 
-**Status:** Accepted (with noted limitation)
+**Date:** 2026-08-29
+**Status:** Accepted — revisit before production
 
 **Context:** After a product upsert is committed to Postgres, an event must be published to Kafka. If the service crashes between DB commit and Kafka publish, the event is silently lost.
 
@@ -334,6 +403,7 @@ All three domain topics (`product.changed`, `price.changed`, `stock.changed`) ar
 | `stock-service` | Design only per brief. Ordering and idempotency are documented in §4c. |
 | Composite read model | Not required; BFF read path is design only. |
 | Transactional outbox | Correct production approach but adds scope; documented in ADR-004. |
+| Log compaction config | Topics auto-created for this exercise; production config documented in §6. |
 | Schema registry | Would version `ProductChanged` event contract. Worth adding; not worth the time here. |
 | Auth / pagination / CI/CD | Explicitly out of scope per brief. |
 | Real search engine (Elasticsearch / OpenSearch) | Explicitly out of scope per brief; indexer logs the document instead. |

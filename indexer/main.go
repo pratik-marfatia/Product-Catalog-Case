@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
@@ -13,7 +12,6 @@ import (
 	"github.com/segmentio/kafka-go"
 
 	"github.com/example/indexer/internal/consumer"
-	"github.com/example/indexer/internal/document"
 )
 
 func main() {
@@ -52,29 +50,7 @@ func main() {
 		slog.String("group", groupID),
 	)
 
-	err := consumer.Run(ctx, reader, func(msg kafka.Message) error {
-		var event document.ProductEvent
-		if err := json.Unmarshal(msg.Value, &event); err != nil {
-			// Malformed JSON cannot be fixed by retrying — log and skip.
-			slog.Error("malformed event — skipping",
-				slog.Int64("offset", msg.Offset),
-				slog.Int("partition", msg.Partition),
-				slog.String("error", err.Error()),
-			)
-			return nil
-		}
-
-		doc := document.Build(event)
-
-		// In production this would be an HTTP/gRPC call to the search engine.
-		// For this exercise we log the document that would have been sent.
-		slog.Info("index document",
-			slog.String("event_id", event.EventID),
-			slog.String("product_id", doc.ID),
-			slog.Any("document", doc),
-		)
-		return nil
-	})
+	err := consumer.Run(ctx, reader, consumer.Handle)
 
 	if err != nil && !errors.Is(err, context.Canceled) {
 		slog.Error("consumer stopped with error", slog.String("error", err.Error()))

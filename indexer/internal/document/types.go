@@ -9,7 +9,7 @@ type ProductEvent struct {
 	EventID       string    `json:"eventId"`
 	EventType     string    `json:"eventType"`
 	OccurredAt    time.Time `json:"occurredAt"`
-	SchemaVersion string    `json:"schemaVersion"`
+	SchemaVersion int       `json:"schemaVersion"`
 	Payload       Payload   `json:"payload"`
 }
 
